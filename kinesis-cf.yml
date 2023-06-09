@@ -1,0 +1,185 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  bucketName:
+    Type: String
+    Default: app-logs-2023-03-22
+
+  kinesisDataStreamName:
+    Type: String
+    Default: app-logs-data-stream
+
+  kinesisDeliveryStreamName:
+    Type: String
+    Default: app-logs-delivery-stream
+
+  openSearchCollectionName:
+    Type: String
+    Default: app-logs-collection
+
+  openSearchUser:
+    Type: String
+    Default: kserain
+
+Resources:
+  KinesisDataStream: 
+      Type: AWS::Kinesis::Stream 
+      Properties: 
+          Name: !Sub ${kinesisDataStreamName} 
+          StreamModeDetails: 
+            StreamMode: ON_DEMAND
+
+  ApplicationLogsCollection:
+    Type: 'AWS::OpenSearchServerless::Collection'
+    DependsOn: 
+      - OpenSearchEncryptionPolicy
+      - OpenSearchNetworkPolicy
+      - OpenSearchAccessPolicy
+    Properties:
+      Name: !Sub ${openSearchCollectionName} 
+      Type: SEARCH
+
+  OpenSearchEncryptionPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: collection-encryption-policy
+      Type: encryption
+      Policy: !Sub >-
+        {
+          "Rules":[{
+            "ResourceType":"collection",
+            "Resource":["collection/${openSearchCollectionName}"]
+          }],
+          "AWSOwnedKey":true
+        }
+
+  OpenSearchNetworkPolicy:
+    Type: 'AWS::OpenSearchServerless::SecurityPolicy'
+    Properties:
+      Name: collection-network-policy
+      Type: network
+      Policy: !Sub >-
+        [
+          {
+            "Rules":[{
+              "ResourceType":"collection",
+              "Resource":["collection/${openSearchCollectionName}"]
+            }, {
+              "ResourceType":"dashboard",
+              "Resource":["collection/${openSearchCollectionName}"]
+            }],
+          "AllowFromPublic":true
+          }
+        ]
+
+  OpenSearchAccessPolicy:
+      Type: 'AWS::OpenSearchServerless::AccessPolicy'
+      Properties:
+        Name: collection-access-policy
+        Type: data
+        Policy: !Sub >-
+          [{
+            "Description":"Access for test-user",
+            "Rules":[{
+              "ResourceType":"index",
+              "Resource":["index/*/*"],
+              "Permission":["aoss:*"]
+            },{
+              "ResourceType":"collection",
+              "Resource":["collection/${openSearchCollectionName}"],
+              "Permission":["aoss:*"]
+            }],
+            "Principal":[
+              "arn:aws:iam::${AWS::AccountId}:user/${openSearchUser}", 
+              "${DeliveryRole.Arn}"
+            ]
+          }]
+
+  ApplicationLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName: !Sub ${bucketName} 
+
+  KinesisDeliveryStream:
+      Type: AWS::KinesisFirehose::DeliveryStream
+      DependsOn: 
+      - KinesisDataStream
+      - ApplicationLogsBucket
+      - ApplicationLogsCollection
+      Properties: 
+        DeliveryStreamName: !Sub ${kinesisDeliveryStreamName}
+        DeliveryStreamType: KinesisStreamAsSource
+        AmazonOpenSearchServerlessDestinationConfiguration: 
+          IndexName: application-logs-index
+          CollectionEndpoint: !GetAtt ApplicationLogsCollection.CollectionEndpoint
+          RoleARN: !GetAtt DeliveryRole.Arn
+          BufferingHints: 
+            IntervalInSeconds: 60
+          CloudWatchLoggingOptions: 
+            Enabled: true
+            LogGroupName: !Sub '/aws/kinesisfirehose/${kinesisDeliveryStreamName}'
+            LogStreamName: "destination-logs"
+          S3Configuration:
+            BucketARN: !GetAtt ApplicationLogsBucket.Arn
+            RoleARN: !GetAtt DeliveryRole.Arn
+            CloudWatchLoggingOptions: 
+              Enabled: true
+              LogGroupName: !Sub '/aws/kinesisfirehose/${kinesisDeliveryStreamName}-backup'
+              LogStreamName: "backup-logs"
+        KinesisStreamSourceConfiguration: 
+          KinesisStreamARN: !GetAtt KinesisDataStream.Arn
+          RoleARN: !GetAtt DeliveryRole.Arn
+
+  DeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+            
+  DeliveryStreamPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles:
+        - !Ref DeliveryRole
+      PolicyName: firehose_delivery_policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:AbortMultipartUpload
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+              - s3:PutObject
+            Resource:
+              - !GetAtt ApplicationLogsBucket.Arn
+              - !Join
+                - ''
+                - - !GetAtt ApplicationLogsBucket.Arn
+                  - '/*'
+          - Effect: Allow
+            Action:
+              - kinesis:DescribeStream
+              - kinesis:GetShardIterator
+              - kinesis:GetRecords
+              - kinesis:ListShards
+            Resource:
+              - !Sub 'arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${kinesisDataStreamName}'
+          - Effect: Allow
+            Action:
+              - es:DescribeElasticsearchDomain
+              - es:DescribeElasticsearchDomains
+              - es:DescribeElasticsearchDomainConfig
+              - es:ESHttpPost
+              - es:ESHttpPut
+            Resource:
+              - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/%FIREHOSE_POLICY_TEMPLATE_PLACEHOLDER%'
+              - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/%FIREHOSE_POLICY_TEMPLATE_PLACEHOLDER%/*'
+  
